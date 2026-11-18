@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Stops T3 Code agent scopes (t3code-*.scope) whose agent process has exited.
+#
+# On Linux, T3 Code starts each agent with `systemd-run --user --scope`. The
+# agent process is a child of the T3 server. When the agent exits, its
+# descendants stay in the scope under `systemd --user`, and the scope stays
+# active. T3 stops the scopes of Claude, ACP, Pi and Muse itself, but not the
+# scope of the shared Codex app-server (see pingdotgg/t3code#21299).
+#
+# Rule: a scope where no process has a parent in t3code.service is orphaned.
+# After GRACE seconds in that state, the scope is stopped. Agent scopes use
+# KillMode=control-group, so all of their processes stop. Terminal scopes
+# (t3code-terminal-*) are skipped unless T3_SCOPE_REAPER_TERMINALS=1.
+#
+# Usage: t3-scope-reaper [--dry-run]
+set -euo pipefail
+
+VERSION=0.1.0
+GRACE=${T3_SCOPE_REAPER_GRACE:-600}
+TERMINALS=${T3_SCOPE_REAPER_TERMINALS:-0}
+SERVICE=${T3_SCOPE_REAPER_SERVICE:-t3code.service}
+DRY=0
+
+case "${1:-}" in
+  "") ;;
+  --dry-run) DRY=1 ;;
+  --version) echo "t3-scope-reaper $VERSION"; exit 0 ;;
+  -h|--help) sed -n '2,15s/^# \{0,1\}//p' "$0"; exit 0 ;;
+  *) echo "unknown option: $1" >&2; exit 2 ;;
+esac
+
+if ! [[ "$GRACE" =~ ^[0-9]+$ ]]; then
+  echo "T3_SCOPE_REAPER_GRACE must be a number of seconds" >&2
+  exit 2
+fi
+
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/t3-scope-reaper
+uid=$(id -u)
+agents=/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/app.slice/app-t3code.slice/app-t3code-agents.slice
+
+# While T3 restarts, live agents have no parent in the service. Decide nothing
+# until the service is active again.
+if [ "$(systemctl --user is-active "$SERVICE" 2>/dev/null)" != active ]; then
+  echo "$SERVICE is not active: no action"
+  exit 0
+fi
+server_cgroup=/sys/fs/cgroup$(systemctl --user show "$SERVICE" -p ControlGroup --value)
+declare -A server_pids=()
+while read -r pid; do server_pids[$pid]=1; done < <(find "$server_cgroup" -name cgroup.procs -exec cat {} + 2>/dev/null)
+if [ ${#server_pids[@]} -eq 0 ]; then
+  echo "no process in $SERVICE: no action"
+  exit 0
+fi
+
+[ "$DRY" = 1 ] || mkdir -p "$STATE"
+now=$(date +%s)
+declare -A orphans=()
+shopt -s nullglob
+
+for scope in "$agents"/t3code-*.scope "$agents"/*/t3code-*.scope; do
+  unit=${scope##*/}
+  mapfile -t pids < <(find "$scope" -name cgroup.procs -exec cat {} + 2>/dev/null)
+  [ ${#pids[@]} -gt 0 ] || continue
+
+  alive=0
+  for pid in "${pids[@]}"; do
+    ppid=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null) || continue
+    if [ -n "$ppid" ] && [ -n "${server_pids[$ppid]:-}" ]; then alive=1; break; fi
+  done
+  [ "$alive" = 1 ] && continue
+
+  processes=$(for pid in "${pids[@]}"; do
+    printf '%s:%s ' "$pid" "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-120)"
+  done)
+
+  # A closed terminal can leave a service on purpose (a proxy, a dev server
+  # started with nohup). Keep these scopes unless asked otherwise.
+  if [[ "$unit" == t3code-terminal-* ]] && [ "$TERMINALS" != 1 ]; then
+    [ "$DRY" = 1 ] && echo "skipped orphaned terminal $unit: $processes"
+    continue
+  fi
+
+  orphans[$unit]=1
+  if [ "$DRY" = 1 ]; then
+    echo "orphaned $unit (${#pids[@]} processes): $processes"
+    continue
+  fi
+
+  [ -f "$STATE/$unit" ] || echo "$now" > "$STATE/$unit"
+  since=$(( now - $(cat "$STATE/$unit") ))
+  if [ "$since" -lt "$GRACE" ]; then
+    echo "orphaned $unit for ${since}s, stop after ${GRACE}s: $processes"
+    continue
+  fi
+
+  echo "stopping $unit, orphaned for ${since}s: $processes"
+  if systemctl --user stop --no-block "$unit"; then
+    rm -f "$STATE/$unit"
+  else
+    echo "could not stop $unit" >&2
+  fi
+done
+
+# Forget scopes that are no longer orphaned or no longer exist.
+if [ "$DRY" = 0 ]; then
+  for file in "$STATE"/*; do
+    [ -n "${orphans[${file##*/}]:-}" ] || rm -f "$file"
+  done
+fi

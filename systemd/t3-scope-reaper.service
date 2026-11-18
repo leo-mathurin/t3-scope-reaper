@@ -1,0 +1,11 @@
+[Unit]
+Description=Stop T3 Code agent scopes whose agent has exited
+After=t3code.service
+
+[Service]
+Type=oneshot
+Nice=19
+TimeoutStartSec=2min
+ExecStart=%h/.local/bin/t3-scope-reaper
+# Environment=T3_SCOPE_REAPER_GRACE=600
+# Environment=T3_SCOPE_REAPER_TERMINALS=1

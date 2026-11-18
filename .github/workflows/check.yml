@@ -1,0 +1,18 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck t3-scope-reaper install.sh
+      - name: Verify systemd units
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cp t3-scope-reaper "$HOME/.local/bin/"
+          systemd-analyze verify --user systemd/t3-scope-reaper.service systemd/t3-scope-reaper.timer
